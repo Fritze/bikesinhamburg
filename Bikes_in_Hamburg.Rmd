@@ -1,0 +1,317 @@
+---
+title: "first"
+author: "Friedrich Preußer"
+date: "2/10/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(osmdata)
+library(sf)
+library(purrr)
+library(here)
+library(viridis)
+```
+
+
+#get location of Hamburg
+```{r}
+city <- "Hamburg"
+getbb(city)
+
+```
+
+#get first overview of Hamburg
+```{r}
+streets <- city %>%
+  opq() %>%
+  add_osm_feature(key = "highway", 
+                  value = c("motorway", "primary", 
+                            "secondary")) %>%
+  osmdata_sf()
+
+#river
+river <- city %>%
+  opq() %>%
+  add_osm_feature(key = "waterway", value = "river") %>%
+  osmdata_sf()
+
+ggplot() +
+  geom_sf(data = streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          size = .4,
+          alpha = .8)
+
+#smaller
+ggplot() +
+  geom_sf(data = streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          size = .4,
+          alpha = .8) +
+     coord_sf(xlim = c(9.75, 10.2),
+            ylim = c(53.5, 53.65),
+            expand = FALSE)
+
+```
+
+#load data
+```{r}
+
+#list of stations
+stations <- read.csv(file.path(here(), "data", "bikeshare_stations_hh.csv"))
+stations_sf <- stations %>%
+  st_as_sf(coords = c("lon", "lat"), crs=4326)
+
+#list of trips
+trips <- read.csv(file.path(here(), "data", "bikeshare_trips_hh.csv"))
+
+#landuse in hamburg
+landuse <- readRDS(file.path(here(), "data", "landuse_sf.rds"))
+
+#fix different GDAL versions
+#see here: https://stackoverflow.com/questions/61286108/error-in-cpl-transformx-crs-aoi-pipeline-reverse-ogrcreatecoordinatetrans
+st_crs(landuse) <- 25832
+
+landuse_sf <- landuse %>%
+  st_transform(., 4326)
+```
+
+#plot landuse
+```{r}
+
+ggplot(landuse_sf) +
+  geom_sf(aes(fill=fclass), lwd = 0) +
+  them_void()
+
+```
+
+#plot stations and landuse
+```{r}
+
+
+ggplot() +
+  geom_sf(data=landuse_sf, aes(fill=fclass), lwd = 0) +
+  geom_sf(data = streets$osm_lines,
+        inherit.aes = FALSE,
+        color = "black",
+        size = .4,
+        alpha = .8)  +
+  geom_sf(data=stations_sf, fill="lightblue",shape=21, alpha=0.5)+
+  theme_void()+
+  coord_sf(xlim = c(9.9, 10.1),
+          ylim = c(53.5, 53.65),
+          expand = FALSE)+
+  ggsave("test.png")
+
+```
+
+#identify most common trips
+```{r}
+
+#most common trips
+common_trips <- trips %>% 
+  left_join(stations, by=c("start_rental_zone_hal_id" = "station_id")) %>%
+  left_join(stations, by=c("end_rental_zone_hal_id" = "station_id"),suffix=c("_start","_end")) %>%
+  group_by(start_rental_zone_hal_id,end_rental_zone_hal_id) %>%
+  mutate(number_trips = n()) %>%
+  group_by(start_rental_zone_hal_id,end_rental_zone_hal_id,number_trips) %>%
+  summarise() %>%
+  rename(start_id = start_rental_zone_hal_id, end_id = end_rental_zone_hal_id) %>%
+  arrange(desc(number_trips))
+
+#show most common trips with names
+common_trips %>%
+  left_join(stations, by=c("start_id" = "station_id" )) %>%
+    left_join(stations, by=c("end_id" = "station_id"),suffix=c("_start","_end")) %>%
+  select(start_id, name_start, end_id,name_end, number_trips)
+
+```
+
+#identify most used stations 
+```{r}
+most_used_stations <- common_trips %>%
+  group_by(end_id) %>%
+  summarise(sum_ends = sum(number_trips)) %>%
+  arrange(desc(sum_ends)) %>%
+  left_join(stations, by=c("end_id" = "station_id"))
+
+```
+#from which landuse to which ?
+```{r}
+#which stations in which landuse?
+#d <- st_join(stations_sf, landuse_sf)
+# stations_nearest <- st_join(stations_sf, landuse_sf, join = st_nearest_feature)
+
+library(units)
+r250 <- set_units(250, m)
+
+#do this only for five most used stations
+stations_circles <- most_used_stations %>%
+  #take only the most used stations (for "end")
+  slice(1:20) %>%
+  mutate(order = 1:n()) %>%
+  # change to Irish grid, which uses meters
+  st_as_sf(coords = c("lon", "lat"), crs=4326) %>%
+  st_transform(.,29902) %>%
+  #draw circle of 250m around each station
+  st_buffer(., r250) %>%
+  st_transform(.,4326)
+
+#both stations and stations with circles are now back in 4326
+#landuse_sf is also in 4326
+
+#check points
+ggplot() +
+  geom_sf(data=landuse_sf, aes(fill=fclass), lwd = 0) +
+  geom_sf(data = stations_sf)+
+  geom_sf(data=stations_circles,alpha=0.1)+
+  coord_sf(xlim = c(9.95, 10.05),
+          ylim = c(53.54, 53.56),
+          expand = FALSE)
+
+
+#now which landuse polygons intersect with our station radius?
+stations_circles_nearest <- st_intersection(landuse_sf, stations_circles)
+
+#get a percentage of surrounding amendities (=landuse categories) for each station)
+stations_nearest_amenities <- stations_circles_nearest %>%
+  as.data.frame() %>%
+  group_by(end_id,fclass,name.1,order) %>%
+  summarise(n_type=n()) %>%
+  group_by(end_id) %>%
+  mutate(perc=n_type/sum(n_type)*100) %>%
+  arrange(order)
+
+ggplot(stations_nearest_amenities,aes(y=n_type, x=factor(name.1,levels=unique(stations_nearest_amenities$name.1)),fill=fclass)) +
+  geom_bar(position="dodge", stat="identity")+
+  theme_classic()+
+  ggtitle("Counts of nearby amenties (based on counts of landuse data within 250m radius)\nShow only top 20 used stations")+
+  labs(x="name",y="counts")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  ggsave("counts_ameneties_at_end_points.png",width=8,height = 6)
+  
+
+
+#now how many pubs intersect with our station radius?
+query_restaurant <- opq(bbox = 'Hamburg') %>%
+  add_osm_feature(key = 'restaurant') %>% 
+  osmdata_sf()
+
+query_restaurant
+stations_circles
+ggplot() +
+  geom_sf(data = query_bar$osm_points,
+          inherit.aes = FALSE,
+          size = 1,
+          alpha = 0.5,
+          shape=21,
+          fill="red")
+
+stations_circles_nearest_restaurants <- st_intersection(query_restaurant, stations_circles)
+
+
+
+
+```
+
+
+```{r}
+common_trips_landuse <- common_trips %>% 
+  left_join(stations_nearest, by=c("start_id" = "station_id")) %>%
+  left_join(stations_nearest, by=c("end_id" = "station_id"),suffix=c("_start","_end"))
+
+counts_trips_landuse <- common_trips_landuse %>%
+  group_by(fclass_start, fclass_end)%>%
+  summarise(n=sum(number_trips)) %>%
+  arrange(desc(n)) 
+
+ggplot(counts_trips_landuse,aes(fclass_start,fclass_end))+
+  geom_tile(aes(fill=n))+
+  scale_fill_viridis(option="magma")
+
+```
+
+
+#make trips as sf line objects 
+```{r}
+
+make_line <- function(lat_start, lat_end, lon_start, lon_end) {
+      st_linestring(matrix(c(lat_start, lat_end, lon_start, lon_end), 2, 2))
+}
+
+
+five_common_trips <- common_trips[1:5,] %>%
+  left_join(stations, by=c("start_id" = "station_id")) %>%
+  left_join(stations, by=c("end_id" = "station_id"),suffix=c("_start","_end")) %>% 
+  ungroup() %>%
+  # select(lat_start, lon_start, lat_end, lon_end) %>%
+  mutate(line=map(make_line,lat_start, lat_end, lon_start, lon_end))
+  # st_as_sfc(crs = 4326)
+
+ggplot() +
+  geom_sf(data = streets$osm_lines,
+        inherit.aes = FALSE,
+        color = "black",
+        size = .4,
+        alpha = .8)  +
+  geom_sf(data=common_trips_sf_e, alpha=0.75,aes(color=count_ends))+
+  theme_void()+
+  coord_sf(xlim = c(9.75, 10.2),
+          ylim = c(53.5, 53.65),
+          expand = FALSE)+
+  scale_color_viridis(option="magma")+
+  ggsave("most_common_end_points.png",width=8,height = 4)
+```
+
+```{r}
+common_trips_sf_s <- common_trips %>%
+  group_by(start_id) %>%
+  mutate(count_starts = sum(number_trips)) %>%
+  group_by(start_id,count_starts) %>%
+  summarise() %>%
+  left_join(stations, by=c("start_id" = "station_id")) %>% 
+  arrange(desc(count_starts)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs=4326)
+
+common_trips_sf_e <- common_trips %>%
+  group_by(end_id) %>%
+  mutate(count_ends = sum(number_trips)) %>%
+  group_by(end_id,count_ends) %>%
+  summarise() %>%
+  left_join(stations, by=c("end_id" = "station_id")) %>%
+  arrange(desc(count_ends)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs=4326)
+
+ggplot() +
+  geom_sf(data = streets$osm_lines,
+        inherit.aes = FALSE,
+        color = "black",
+        size = .4,
+        alpha = .8)  +
+  geom_sf(data=common_trips_sf_s, alpha=0.75,aes(color=count_starts))+
+  theme_void()+
+  coord_sf(xlim = c(9.75, 10.2),
+          ylim = c(53.5, 53.65),
+          expand = FALSE)+
+  scale_color_viridis(option="magma")+
+  ggsave("most_common_start_points.png",width=8,height = 4)
+
+ggplot() +
+  geom_sf(data = streets$osm_lines,
+        inherit.aes = FALSE,
+        color = "black",
+        size = .4,
+        alpha = .8)  +
+  geom_sf(data=common_trips_sf_e, alpha=0.75,aes(color=count_ends))+
+  theme_void()+
+  coord_sf(xlim = c(9.75, 10.2),
+          ylim = c(53.5, 53.65),
+          expand = FALSE)+
+  scale_color_viridis(option="magma")+
+  ggsave("most_common_end_points.png",width=8,height = 4)
+
+```
